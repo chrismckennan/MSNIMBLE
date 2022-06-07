@@ -1,0 +1,374 @@
+---
+title: "Simulation"
+author: "Shangshu Zhao"
+date: "5/13/2022"
+output: html_document
+---
+
+Code to reproduce simulations from our manuscript.
+
+#Load packages
+
+Packages "qvalue", "sva", and "impute" should be installed through BiocManager.
+
+```{r packages}
+library(qvalue)
+library(sva)
+library(impute)
+library(ggplot2)
+library(ggbreak)
+library(gridExtra)
+library(bcv)
+library(impute)
+library(missForest)
+library(cate)
+
+#Install MS-NIMBLE if not already installed#
+if (!"MSNIMBLE"%in%installed.packages()[,1]) {devtools::install_github("https://github.com/chrismckennan/MSNIMBLE")}
+```
+
+#Source functions
+
+First file provides function that simulate data and missingness based on parameters preset
+Second file ("util.R") contains all the functions required for analyzing simulation
+
+```{r SourceFunctions}
+source('SimulateMetaboliteDataMatrix_WithConounding.R')
+source('util.R')
+```
+
+# Preset Parameters
+
+```{r Parameters}
+p <- 1200  # Number of metabolites
+n <- 600   # Number of samples
+n.sim <- 50 # Number of simulations
+Info <- c(0.61, 0.33, 0.19, 0.14, 0.12, 0.08, 0.07, 0.05, 0.05, 0.05) # 1/p*L'Sigma^{-1}L
+
+seed <- sample(x = 1000, size = n.sim, replace = FALSE) # Preset simulation seeds
+
+Ind.Confident <- matrix(FALSE, p, n.sim)
+Frac.Missing <- matrix(NA, p, n.sim) # To save the missing fraction of metabolites
+B.simulate <- matrix(NA, p, n.sim) # To save the simulated values of covariates of interest
+# To save the estimated beta, estimated beta variance and their p-values
+B.MS_NIMBLE <- B.MetabMiss <- B.MIN <- B.SVD <- B.KNN <- B.RF <- matrix(NA, p, n.sim)
+V.MS_NIMBLE <- V.MetabMiss <- V.MIN <- V.SVD <- V.KNN <- V.RF <- matrix(NA, p, n.sim)
+p.MS_NIMBLE <- p.MetabMiss <- p.MIN <- p.SVD <- p.KNN <- p.RF <- matrix(NA, p, n.sim)
+```
+
+# Main Simulation
+
+```{r simulation}
+for (i in 1:n.sim) {
+  cat('iteration:', i, "\n")
+  set.seed(seed = seed[i]) # set iteration seed
+  
+  # Simulate data and missing values
+  out.simulate <- SimMetab.Matrix.conf(
+    n = n, 
+    p = p, 
+    X = c(rep(1,n/2), rep(0,n/2)), 
+    log.a.mean = log(1), # Mean for log(scale) missing mechanism parameters
+    log.a.sd = 0.4, # Variance for log(scale) missing mechanism parameters
+    y0.mean = 16,   # Mean for simulate location missing mechanism parameters
+    y0.sd  = 1.2,   # Variance for simulate location missing mechanism parameters 
+    mu.mean = 18,   # Average global mean
+    mu.sd = 5,      # Standard deviation of the global means
+    Info.vec = Info,# 1/p*L'Sigma^{-1}L
+    sd.L  = 0.5,    # L 
+    mean.rv = 1,    # Mean residual variance
+    sd.rv = 0.2,    # Standard deviation of the residual variances
+    skew.resid = 0, 
+    miss.mech = "logit", # Functional form of the missing mechanism. 
+    skew.miss = runif(p, min = range.skew.miss[1], max = range.skew.miss[2]), 
+    Omega = c(2, rep(0, length(Info)-1)),  # With this Omega, C explains 7.5% of the variance in X, on average
+    delta.B = 0.20, # Fraction of non-zero entries
+    sigma.B = 0.4,  # SD of effect size for non-zero entries
+    mean.B  = 0
+  )
+  Frac.Missing[,i] <- 1 - out.simulate$Frac.Obs # Save metabolites' missing fraction
+  B.simulate[,i] <- out.simulate$B # Save simulated Beta
+
+  # Get missing mechanism
+  out.miss.logit.i <- MSNIMBLE::EstimateMissing(
+    Y = out.simulate$Y,
+    K = 5,
+    max.missing.consider = 0.5,
+    max.miss.C = 0.05,
+    n.repeat.Sigma.C = 1,
+    n.K.GMM = 2,
+    min.a = 0.1,
+    max.a = 7,
+    min.y0 = 10,
+    max.y0 = 30,
+    t.df = 4,
+    p.min.1 = 0,
+    p.min.2 = 0,
+    BH.analyze.min = 0.25,
+    min.quant.5 = 0,
+    shrink.Est = T,
+    prop.y0.sd = 0.2,
+    prop.a.sd = 0.2,
+    n.boot.J = 150,
+    n.iter.MCMC = 6e3,
+    n.burn.MCMC = 2e3,
+    Model.Pvalue = F,
+    Bayes.est = "EmpBayes",
+    simple.average.EB = T)
+  Ind.Confident[out.miss.logit.i$Ind.Confident,i] <- TRUE # Save the index of confident metabolites
+
+  # Run MetabMiss
+  out.MetabMiss <- MSNIMBLE::DiffAbundance(Y = out.simulate$Y, X = out.simulate$X, Z = out.simulate$Z, K = length(Info), Miss.Mech = out.miss.logit.i, max.miss.perp = 0.5, max.miss.image = 0.5, method = "sIPW", BH.min = 0.25, refine.C = F, p.refine.both = F)
+  # Save results
+  B.MetabMiss[,i] <- out.MetabMiss$Beta.iter
+  V.MetabMiss[,i] <- sapply(out.MetabMiss$Var.beta.iter,function(x){x[1]})
+  p.MetabMiss[,i] <- out.MetabMiss$p.t.iter
+
+  # Run MS-NIMBLE
+  out.MS_NIMBLE <- MSNIMBLE::DiffAbundance(Y = out.simulate$Y, X = out.simulate$X, Z = out.simulate$Z, K = length(Info), Miss.Mech = out.miss.logit.i, max.miss.perp = 0.5, max.miss.image = 0.5, method = "MSNIMBLE", BH.min = 0.25, refine.C = F, p.refine.both = F)
+  # Save results
+  B.MS_NIMBLE[,i] <- out.MS_NIMBLE$Beta.iter
+  V.MS_NIMBLE[,i] <- sapply(out.MS_NIMBLE$Var.beta.iter,function(x){x[1]})
+  p.MS_NIMBLE[,i] <- out.MS_NIMBLE$p.t.iter
+
+  # Impute data by Minimum Value
+  out.impute <- impute.missing(data = out.simulate$Y, methods = c("MIN"))
+  # Regression analysis on MIN Imputation
+  out.MIN <- get.OLS(Y = out.impute$MIN, X = out.simulate$X, Z = out.simulate$Z, K = 10)
+  # Save results
+  B.MIN[,i] <- out.MIN$B
+  V.MIN[,i] <- out.MIN$Var.Beta
+  p.MIN[,i] <- out.MIN$p.t
+
+  # Impute data by SVD
+  out.impute <- impute.missing(data = out.simulate$Y, methods = c("SVD"))
+  # Regression analysis on SVD Imputation
+  out.SVD <- get.OLS(Y = out.impute$SVD, X = out.simulate$X, Z = out.simulate$Z, K = 10)
+  # Save results
+  B.SVD[,i] <- out.SVD$B
+  V.SVD[,i] <- out.SVD$Var.Beta
+  p.SVD[,i] <- out.SVD$p.t
+
+  # Impute data by KNN
+  out.impute <- impute.missing(data = out.simulate$Y, methods = c("KNN"))
+  # Regression analysis on KNN Imputation
+  out.KNN <- get.OLS(Y = out.impute$KNN, X = out.simulate$X, Z = out.simulate$Z, K = 10)
+  # Save results
+  B.KNN[,i] <- out.KNN$B
+  V.KNN[,i] <- out.KNN$Var.Beta
+  p.KNN[,i] <- out.KNN$p.t
+
+  # Impute data by Random Forest
+  out.impute <- impute.missing(data = out.simulate$Y, methods = c("RF"))
+  # Regression analysis on imputed data
+  out.RF  <- get.OLS(Y = out.impute$RF,  X = out.simulate$X, Z = out.simulate$Z, K = 10)
+  # Save results
+  B.RF[,i] <- out.RF$B
+  V.RF[,i] <- out.RF$Var.Beta
+  p.RF[,i] <- out.RF$p.t
+}
+
+# Compute Z scores for all methods
+Z.MetabMiss <- (B.MetabMiss - B.simulate) / sqrt(V.MetabMiss)
+Z.MS_NIMBLE <- (B.MS_NIMBLE - B.simulate) / sqrt(V.MS_NIMBLE)
+Z.MIN       <- (B.MIN       - B.simulate) / sqrt(V.MIN)
+Z.SVD       <- (B.SVD       - B.simulate) / sqrt(V.SVD)
+Z.KNN       <- (B.KNN       - B.simulate) / sqrt(V.KNN)
+Z.RF        <- (B.RF        - B.simulate) / sqrt(V.RF)
+```
+
+# Confidence Interval Coverage
+
+```{r CIC}
+B.breaks <- c(-1, 0, 0.2, 0.4, 0.6, 0.8, Inf) # partition the CI by levels of simulated beta
+
+# Calculate the Confidence Interval Coverage for all methods
+CIC.MetabMiss <- get.CIC(Z = Z.MetabMiss, B = B.simulate, Frac = Frac.Missing, breaks = B.breaks)
+CIC.MS_NIMBLE <- get.CIC(Z = Z.MS_NIMBLE, B = B.simulate, Frac = Frac.Missing, breaks = B.breaks)
+CIC.MIN       <- get.CIC(Z = Z.MIN,       B = B.simulate, Frac = Frac.Missing, breaks = B.breaks)
+CIC.SVD       <- get.CIC(Z = Z.SVD,       B = B.simulate, Frac = Frac.Missing, breaks = B.breaks)
+CIC.KNN       <- get.CIC(Z = Z.KNN,       B = B.simulate, Frac = Frac.Missing, breaks = B.breaks)
+CIC.RF        <- get.CIC(Z = Z.RF,        B = B.simulate, Frac = Frac.Missing, breaks = B.breaks)
+
+method.id <- c("MIN", "SVD", "KNN", "RF", "MetabMiss", "MS-NIMBLE")
+colors.id <- c("black","orange","blue","darkred","tan3","purple")
+
+phenotype.CI <- data.frame(
+  CIC = c(CIC.MIN, CIC.SVD, CIC.KNN, CIC.RF, CIC.MetabMiss, CIC.MS_NIMBLE),
+  breaks = factor(rep(seq(1, 6), length(method.id))),
+  method = factor(rep(method.id, each = length(B.breaks)-1), levels = c("MS-NIMBLE", "MetabMiss", "MIN", "SVD", "KNN", "RF"))
+)
+
+# Plot the Confidence Interval Coverage using ggplot
+pdf('CI coverage.pdf', width = 7, height = 7 )
+ggplot(phenotype.CI) +
+  geom_point(aes(x=breaks, y=CIC, shape=method, colour=method), size=3) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "grey", size = 1) +
+  scale_shape_manual(values = c(16, 18 , 1, 2, 4, 5, 20)) +
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(
+    labels=c(
+      expression(    "|" ~ italic(beta["*g"]) ~ "|" ==0.0),
+      expression(0.0<"|" ~ italic(beta["*g"]) ~ "|" <=0.2),
+      expression(0.2<"|" ~ italic(beta["*g"]) ~ "|" <=0.4),
+      expression(0.4<"|" ~ italic(beta["*g"]) ~ "|" <=0.6),
+      expression(0.6<"|" ~ italic(beta["*g"]) ~ "|" <=0.8),
+      expression(0.8<"|" ~ italic(beta["*g"]) ~ "|")
+    )
+  ) +
+  ggtitle("Confidence Interval Coverage") +
+  ylim(min = 0.25, max = 1.02) +
+  labs(x = '', y = '') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = .5), legend.position = c(0.15, 0.22))
+dev.off()
+```
+
+# Confidence Interval Width
+
+```{r CIW}
+B.breaks <- c(-1, 0, 0.2, 0.4, 0.6, 0.8, Inf)  # partition the CI by levels of simulated beta
+
+# Calculate the Confidence Interval Width for two methods (MetabMiss and MS-NIMBLE)
+CIW.MS_NIMBLE <- get.CIW(V = V.MS_NIMBLE, B = B.simulate, Frac = Frac.Missing, breaks = B.breaks)
+CIW.MetabMiss <- get.CIW(V = V.MetabMiss, B = B.simulate, Frac = Frac.Missing, breaks = B.breaks)
+
+CIW.ggplots <- data.frame(
+  width = c(CIW.MS_NIMBLE$CIW, CIW.MetabMiss$CIW),
+  breaks = c(CIW.MS_NIMBLE$breaks, CIW.MetabMiss$breaks),
+  method = factor(c(rep('MS-NIMBLE', length(CIW.MS_NIMBLE$CIW)), rep('MetabMiss', length(CIW.MetabMiss$CIW))))
+)
+
+# Plot the Confidence Interval using ggplot
+pdf('CIW.pdf')
+ggplot(CIW.ggplots) +
+  geom_boxplot(aes(x = method, y = width)) +
+  geom_hline(yintercept = median(CIW.MetabMiss$CIW), linetype = "dashed", color = "red") +
+  geom_hline(yintercept = median(CIW.MS_NIMBLE$CIW), linetype = "dashed", color = "red") +
+  scale_y_break(c(1.5, 4), scales = 0.5) +
+  labs(x = '', y = '') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = .5))
+dev.off()
+```
+
+# False Discovery Rate
+
+```{r FDP}
+ii=n.sim # This ensures the code below runs when you stop the simulations early.
+
+## Calculate the False Discovery Rate for all methods
+FDP.MetabMiss <- sim.FDP(p.values = p.MetabMiss, B.simulate, Frac.Missing, Ind.Confident, ii)
+FDP.MS_NIMBLE <- sim.FDP(p.values = p.MS_NIMBLE, B.simulate, Frac.Missing, Ind.Confident, ii)
+FDP.MIN       <- sim.FDP(p.values = p.MIN,       B.simulate, Frac.Missing, Ind.Confident, ii)
+FDP.SVD       <- sim.FDP(p.values = p.SVD,       B.simulate, Frac.Missing, Ind.Confident, ii)
+FDP.KNN       <- sim.FDP(p.values = p.KNN,       B.simulate, Frac.Missing, Ind.Confident, ii)
+FDP.RF        <- sim.FDP(p.values = p.RF,        B.simulate, Frac.Missing, Ind.Confident, ii)
+
+method.id <- c("MS-NIMBLE","MetabMiss","MIN","SVD","KNN","RF")
+colors.id <- c("black","brown","orange","blue","darkred","tan3")
+
+## Prepare the FDP  using ggplot
+FDP.ggplots <- data.frame(
+  FDP1 = c(FDP.MS_NIMBLE[,1], FDP.MetabMiss[,1], FDP.MIN[,1], FDP.SVD[,1], FDP.KNN[,1], FDP.RF[,1]),
+  FDP2 = c(FDP.MS_NIMBLE[,2], FDP.MetabMiss[,2], FDP.MIN[,2], FDP.SVD[,2], FDP.KNN[,2], FDP.RF[,2]),
+  FDP3 = c(FDP.MS_NIMBLE[,3], FDP.MetabMiss[,3], FDP.MIN[,3], FDP.SVD[,3], FDP.KNN[,3], FDP.RF[,3]),
+  FDP4 = c(FDP.MS_NIMBLE[,4], FDP.MetabMiss[,4], FDP.MIN[,4], FDP.SVD[,4], FDP.KNN[,4], FDP.RF[,4]),
+  method = factor(rep(method.id, each=n.sim))
+)
+
+FDP_1 <- ggplot(FDP.ggplots) + 
+  geom_boxplot(mapping = aes(x = method, y = FDP1, color = method), show.legend = FALSE) + 
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(name = "", limits = method.id) +
+  labs(x = '', y = '') +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red", size = 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+FDP_2 <- ggplot(FDP.ggplots) + 
+  geom_boxplot(mapping = aes(x = method, y = FDP2, color = method), show.legend = FALSE) + 
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(name = "", limits = method.id) +
+  labs(x = '', y = '') +
+  geom_hline(yintercept = 0.10, linetype = "dashed", color = "red", size = 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+FDP_3 <- ggplot(FDP.ggplots) + 
+  geom_boxplot(mapping = aes(x = method, y = FDP3, color = method), show.legend = FALSE) + 
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(name = "", limits = method.id) +
+  labs(x = '', y = '') +
+  geom_hline(yintercept = 0.15, linetype = "dashed", color = "red", size = 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+FDP_4 <- ggplot(FDP.ggplots) + 
+  geom_boxplot(mapping = aes(x = method, y = FDP4, color = method), show.legend = FALSE) + 
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(name = "", limits = method.id) +
+  labs(x = '', y = '') +
+  geom_hline(yintercept = 0.20, linetype = "dashed", color = "red", size = 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+pdf('FDP.pdf', width = 16, height = 9)
+grid.arrange(FDP_1, FDP_2, FDP_3, FDP_4, ncol = 4,
+             widths = c(2, 2, 2, 2),
+             top = 'False Discovery Rate')
+dev.off()
+```
+
+# True Recovery Proportion
+
+```{r Power}
+## Calculate the True Recovery Proportion for all methods
+Power.MetabMiss <- sim.Power(p.values = p.MetabMiss, B.simulate, Frac.Missing, Ind.Confident)
+Power.MS_NIMBLE <- sim.Power(p.values = p.MS_NIMBLE, B.simulate, Frac.Missing, Ind.Confident)
+Power.MIN       <- sim.Power(p.values = p.MIN,       B.simulate, Frac.Missing, Ind.Confident)
+Power.SVD       <- sim.Power(p.values = p.SVD,       B.simulate, Frac.Missing, Ind.Confident)
+Power.KNN       <- sim.Power(p.values = p.KNN,       B.simulate, Frac.Missing, Ind.Confident)
+Power.RF        <- sim.Power(p.values = p.RF,        B.simulate, Frac.Missing, Ind.Confident)
+
+method.id <- c("MS-NIMBLE","MetabMiss","MIN","SVD","KNN","RF")
+colors.id <- c("black","purple","orange","blue","darkred","tan3")
+
+# Plot the TRP using ggplot
+TRP.ggplots <- data.frame(
+  TRP1 = c(Power.MS_NIMBLE[,1], Power.MetabMiss[,1], Power.MIN[,1], Power.SVD[,1], Power.KNN[,1], Power.RF[,1]),
+  TRP2 = c(Power.MS_NIMBLE[,2], Power.MetabMiss[,2], Power.MIN[,2], Power.SVD[,2], Power.KNN[,2], Power.RF[,2]),
+  TRP3 = c(Power.MS_NIMBLE[,3], Power.MetabMiss[,3], Power.MIN[,3], Power.SVD[,3], Power.KNN[,3], Power.RF[,3]),
+  TRP4 = c(Power.MS_NIMBLE[,4], Power.MetabMiss[,4], Power.MIN[,4], Power.SVD[,4], Power.KNN[,4], Power.RF[,4]),
+  method = factor(rep(method.id, each=n.sim))
+)
+trp_1 <- ggplot(TRP.ggplots) + 
+  geom_boxplot(mapping = aes(x = method, y = TRP1, color = method), show.legend = FALSE) + 
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(name = "", limits = method.id) +
+  labs(x = '', y = '') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+trp_2 <- ggplot(TRP.ggplots) + 
+  geom_boxplot(mapping = aes(x = method, y = TRP2, color = method), show.legend = FALSE) + 
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(name = "", limits = method.id) +
+  labs(x = '', y = '') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+trp_3 <- ggplot(TRP.ggplots) + 
+  geom_boxplot(mapping = aes(x = method, y = TRP3, color = method), show.legend = FALSE) + 
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(name = "", limits = method.id) +
+  labs(x = '', y = '') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+trp_4 <- ggplot(TRP.ggplots) + 
+  geom_boxplot(mapping = aes(x = method, y = TRP4, color = method), show.legend = FALSE) + 
+  scale_color_manual(values = colors.id) +
+  scale_x_discrete(name = "", limits = method.id) +
+  labs(x = '', y = '') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0.5))
+
+pdf('True Recovery Proportion.pdf', width = 16, height = 9)
+grid.arrange(trp_1, trp_2, trp_3, trp_4, ncol = 4,
+             widths = c(2, 2, 2, 2),
+             top = "True Recovery Proportion(Power)")
+dev.off()
+```
