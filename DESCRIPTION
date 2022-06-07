@@ -2,10 +2,11 @@ Package: MSNIMBLE
 Title: Perform differential abundance, factor analysis, and mtGWAS in metabolomic data with non-random missing observations and latent factors.
 Version: 1.0
 Authors@R: 
-    person("Chris", "McKennan", "chm195@pitt.edu", role = "aut")
+    person(given = "Chris", family = "McKennan", email = "chm195@pitt.edu", role = c("aut", "cre"))
 Description: Performs differential abundance factor analysis, and mtGWAS in metabolomic data with non-random missing observations and latent factors. The main functions are "Num.Instruments" to determine the number of instruments to estimate missingness mechanisms; "EstimateMissing" to estimate missingness mechanisms; "DiffAbundance" to perform differential abundance analyses; "mtGWAS" to perform an mtGWAS.
 License: GPL-2
 Depends: parallel, qvalue, sva, fastGHQuad
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.1.2
+LazyData: true
