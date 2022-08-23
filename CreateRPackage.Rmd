@@ -1,0 +1,22 @@
+---
+title: "Create R Package"
+author: "Chris McKennan"
+date: "1/7/2019"
+output: html_document
+---
+Create package with ROxygen2
+
+#Roxygen2 library
+```{r basic_functions}
+#install.packages("devtools")
+library("devtools")
+#devtools::install_github("klutometis/roxygen")
+library(roxygen2)
+```
+
+#Make package
+```{r MakePackage}
+create_package("/Users/Chris/Desktop/UniversityofPittsburgh/Projects/EfficientMetabolomics/MSNIMBLE/")
+document("/Users/Chris/Desktop/UniversityofPittsburgh/Projects/EfficientMetabolomics/MSNIMBLE/")
+install("/Users/Chris/Desktop/UniversityofPittsburgh/Projects/EfficientMetabolomics/MSNIMBLE")
+```
